@@ -50,6 +50,7 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
     {
         public string Id;
         public string Name;
+        public string Faction;
         public int Tier;
         public string Subtitle;
         public string Downside;
@@ -215,6 +216,7 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         {
             Id = ReadText(card.Id),
             Name = ReadText(card.Name),
+            Faction = card.Faction.Row == 0 ? null : ReadText(Mem.Read<AuguryFactionRow>(card.Faction.Row).Name),
             Selected = widget.Selected != 0,
         };
         if (widget.TierRow.Row != 0)
@@ -400,7 +402,7 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         ImGui.TextUnformatted(s.Window == 0 ? "Fates window not found" : $"window 0x{s.Window:X} {(s.WindowVisible ? "open" : "closed")}   cards {s.Fates.Count}");
         foreach (var f in s.Fates)
         {
-            ImGui.SeparatorText($"{f.Name}  T{f.Tier}{(f.Selected ? "  (selected)" : "")}");
+            ImGui.SeparatorText($"{f.Name}  T{f.Tier}  {f.Faction}{(f.Selected ? "  (selected)" : "")}");
             ImGui.TextDisabled(Esc(f.Subtitle ?? ""));
             ImGui.TextUnformatted($"Downside ({f.DownsideMod}):");
             ImGui.Indent();

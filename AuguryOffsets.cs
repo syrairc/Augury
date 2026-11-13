@@ -192,12 +192,25 @@ public struct AuguryCardRow
 {
     // wchar* Id, e.g. Torchbearer
     [FieldOffset(0x00)] public long Id;
+    // AuguryFactions row this card belongs to
+    [FieldOffset(0x14)] public DatRowRef Faction;
     // wchar* display name
     [FieldOffset(0x24)] public long Name;
     // wchar* card art path
     [FieldOffset(0x2C)] public long Art;
     // client flag set once Mora has voiced this card, AuguryFlag.MoraLineFirst + row
     [FieldOffset(0x54)] public int MoraLineFlag;
+}
+
+[StructLayout(LayoutKind.Explicit, Size = 52)]
+public struct AuguryFactionRow
+{
+    // wchar* Id: Savage, Filth or Classic
+    [FieldOffset(0x00)] public long Id;
+    // wchar* faction icon art path
+    [FieldOffset(0x14)] public long Icon;
+    // wchar* display name: Wickerlight, Darktongue or Dreadmaiden
+    [FieldOffset(0x1C)] public long Name;
 }
 
 [StructLayout(LayoutKind.Explicit, Size = 68)]
