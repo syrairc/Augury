@@ -10,5 +10,7 @@ public class AugurySettings : ISettings
     public bool ShowWindow = true;
     public int PollMs = 500;
     public bool LogToFile = true;
+    public bool LogCards = true;
+    public bool DrawBeamTargets = true;
     public int MaxLogLines = 1000;
 }

@@ -41,6 +41,17 @@ public enum RewardClass : long
     High = 2,
 }
 
+public static class AuguryPaths
+{
+    // Coven's Cauldron, StateMachine card_chosen flips 0 -> 1 on pick
+    public const string Cauldron = "Metadata/Terrain/Leagues/Augury/Objects/AuguryCardObject";
+    // the Fate altar where Fates are invoked on a boss
+    public const string Altar = "Metadata/Terrain/Leagues/Augury/Objects/AuguryBossObject";
+    // crow stream spawned on a pick; Beam.BeamEnd is the next cauldron, far outside the network bubble
+    public const string Beam = "Metadata/Effects/SleepableServerBeamEffect";
+    public const string CardChosenState = "card_chosen";
+}
+
 public static class ServerDataOffsets
 {
     // pointer to the client flag object, see FlagObject
@@ -90,7 +101,7 @@ public struct ClientAugury
     [FieldOffset(0x200)] public int FateLimit;
     // card tier selector; matched the per-card tier on the Fates screen
     [FieldOffset(0x204)] public byte Tier;
-    // std::vector of spawns resolved from collected cards, opcode 1
+    // std::vector<asset handle*>, effects/daemons preloaded for collected Fates' boss empowerments (~22 per card), opcode 1; no positions
     [FieldOffset(0x208)] public StdVector Spawns;
 }
 

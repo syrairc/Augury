@@ -5,6 +5,11 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using ExileCore;
+using ExileCore.PoEMemory;
+using ExileCore.PoEMemory.Components;
+using ExileCore.PoEMemory.MemoryObjects;
+using ExileCore.Shared.Enums;
+using ExileCore.Shared.Helpers;
 using ExileCore.Shared.Interfaces;
 using GameOffsets.Native;
 using ExileImGui;
@@ -67,6 +72,7 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         public ClientAugury Augury;
         public long Window;
         public bool WindowVisible;
+        public FatesMode Mode;
         public List<FateCard> Fates = new();
         public List<Card> Hand = new();
         public List<Card> Collected = new();
@@ -83,18 +89,106 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
     private readonly Dictionary<long, string> _rowNames = new();
     private Snapshot _snap = new();
     private string _logPath;
+    private string _cardsPath;
+    private string _zoneFactions;
+    private DateTime _zoneScanDue = DateTime.MaxValue;
+    private string _handSig;
+    private int _handSeq;
+    private List<FateCard> _offered = new();
+    private int _collectedCount = -1;
+    private const float BeamOnCauldronGrid = 30f;
+    private readonly Dictionary<uint, (string kind, Vector2 grid, int chosen)> _mapObjects = new();
+    private readonly List<(Vector2 from, Vector2 to)> _beamTargets = new();
+    private readonly HashSet<uint> _beamsSeen = new();
+    private Func<Vector2, Vector2> _minimapToScreen;
+    private int _minimapProbe;
+    private const string MinimapOverlayKey = "Augury";
+    private Vector2 _pickWatchAt;
+    private DateTime _pickWatchUntil = DateTime.MinValue;
+    private readonly HashSet<uint> _pickWatchSeen = new();
+    private const uint TargetColorU32 = 0xFFFF40FF;
+
+    private static readonly (string prefix, string faction)[] FactionMonsters =
+    {
+        ("Metadata/Monsters/Augury/Cenobite", "Darktongue"),
+        ("Metadata/Monsters/Augury/CauldronCrone", "Darktongue"),
+        ("Metadata/Monsters/Augury/SimulacrumGolem", "Darktongue"),
+        ("Metadata/Monsters/Augury/WitchFamiliar", "Darktongue"),
+        ("Metadata/Monsters/Augury/Savage", "Wickerlight"),
+        ("Metadata/Monsters/Augury/PaleHag", "Dreadmaiden"),
+        ("Metadata/Monsters/Augury/AuguryScreecher", "Dreadmaiden"),
+        ("Metadata/Monsters/Augury/SpinningWheelHag", "Dreadmaiden"),
+        ("Metadata/Monsters/Augury/AuguryUrchin", "Dreadmaiden"),
+    };
+
+    private const string CardsHeader = "time,area,areaLevel,zoneFactions,event,hand,slot,card,cardFaction,tier,downsideMod,reward,rewardClass,rewardLevelMin,rewardLevelMax";
 
     private IMemory Mem => GameController.Memory;
 
     public override bool Initialise()
     {
         _logPath = Path.Combine(ConfigDirectory, "augury-log.txt");
+        _cardsPath = Path.Combine(ConfigDirectory, "augury-cards.csv");
+        _zoneScanDue = DateTime.Now.AddSeconds(2);
+        HookMinimap();
         return true;
+    }
+
+    public override void OnUnload()
+    {
+        GameController?.PluginBridge?.GetMethod<Action<string, Action>>("ExileMinimap.RegisterPanelOverlay")?.Invoke(MinimapOverlayKey, null);
+        base.OnUnload();
+    }
+
+    private void HookMinimap()
+    {
+        var bridge = GameController?.PluginBridge;
+        _minimapToScreen = bridge?.GetMethod<Func<Vector2, Vector2>>("ExileMinimap.GridToScreen");
+        var register = bridge?.GetMethod<Action<string, Action>>("ExileMinimap.RegisterPanelOverlay");
+        if (_minimapToScreen == null || register == null)
+        {
+            _minimapToScreen = null;
+            return;
+        }
+
+        register(MinimapOverlayKey, DrawOnMinimap);
+    }
+
+    private IEnumerable<Vector2> PendingTargets() =>
+        _beamTargets.Select(t => t.to).Where(to => !_mapObjects.Values.Any(o => Vector2.Distance(o.grid, to) <= BeamOnCauldronGrid));
+
+    private void DrawOnMinimap()
+    {
+        if (!Settings.Enable || !Settings.DrawBeamTargets || _minimapToScreen == null) return;
+        var dl = ImGui.GetBackgroundDrawList();
+        foreach (var to in PendingTargets())
+        {
+            var p = _minimapToScreen(to);
+            if (float.IsNaN(p.X)) return;
+            dl.AddCircle(p, 9f, TargetColorU32, 0, 3f);
+            dl.AddCircleFilled(p, 3f, TargetColorU32);
+        }
+    }
+
+    private void DrawOnLargeMap()
+    {
+        if (!Settings.DrawBeamTargets || _minimapToScreen != null) return;
+        if (GameController.IngameState?.IngameUi?.Map?.LargeMap?.IsVisible != true) return;
+        foreach (var to in PendingTargets())
+            Graphics.DrawCircleOnMap(to, true, 8f, SharpDX.Color.Magenta, 3f, 24, VisibleSubMap.Large);
     }
 
     public override void AreaChange(AreaInstance area)
     {
         _rowNames.Clear();
+        _zoneFactions = null;
+        _zoneScanDue = DateTime.Now.AddSeconds(2);
+        _handSig = null;
+        _offered = new List<FateCard>();
+        _collectedCount = -1;
+        _mapObjects.Clear();
+        _beamTargets.Clear();
+        _beamsSeen.Clear();
         Log($"area -> {area?.Name}");
     }
 
@@ -104,7 +198,158 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         _poll.Restart();
         _snap = Read();
         Diff(_snap);
+        if (Settings.LogCards) LogCards(_snap);
+        TrackMap();
         return null;
+    }
+
+    private void TrackMap()
+    {
+        var beams = new List<Entity>();
+        foreach (var e in GameController.Entities)
+        {
+            if (e == null || !e.IsValid) continue;
+            if (e.Path == AuguryPaths.Beam)
+            {
+                if (!_beamsSeen.Contains(e.Id)) beams.Add(e);
+                continue;
+            }
+
+            var kind = e.Path == AuguryPaths.Cauldron ? "cauldron" : e.Path == AuguryPaths.Altar ? "altar" : null;
+            if (kind == null) continue;
+            var chosen = e.GetComponent<StateMachine>()?.States?.FirstOrDefault(st => st.Name == AuguryPaths.CardChosenState)?.Value ?? -1;
+            var grid = e.GridPosNum;
+            if (!_mapObjects.TryGetValue(e.Id, out var old)) Log($"map: {kind} at {grid.X:F0},{grid.Y:F0}{(chosen >= 0 ? $" card_chosen={chosen}" : "")}");
+            else if (old.chosen != chosen)
+            {
+                Log($"map: {kind} at {grid.X:F0},{grid.Y:F0} card_chosen {old.chosen} -> {chosen}");
+                _pickWatchAt = grid;
+                _pickWatchUntil = DateTime.Now.AddSeconds(15);
+                _pickWatchSeen.Clear();
+                foreach (var near in GameController.Entities)
+                    if (near != null && Vector2.Distance(near.GridPosNum, grid) <= 80f) _pickWatchSeen.Add(near.Id);
+            }
+            _mapObjects[e.Id] = (kind, grid, (int)chosen);
+        }
+
+        if (DateTime.Now <= _pickWatchUntil)
+        {
+            foreach (var e in GameController.Entities)
+            {
+                if (e == null || !e.IsValid || _pickWatchSeen.Contains(e.Id) || Vector2.Distance(e.GridPosNum, _pickWatchAt) > 80f) continue;
+                _pickWatchSeen.Add(e.Id);
+                var beam = e.GetComponent<Beam>();
+                var end = beam == null ? "" : $" beamEnd {beam.BeamEndNum.X * PoeMapExtension.WorldToGridConversion:F0},{beam.BeamEndNum.Y * PoeMapExtension.WorldToGridConversion:F0}";
+                Log($"pick-watch: new {e.Path} id={e.Id} at {e.GridPosNum.X:F0},{e.GridPosNum.Y:F0} [{string.Join(",", e.CacheComp.Keys)}]{end}");
+            }
+        }
+
+        foreach (var b in beams)
+        {
+            var beam = b.GetComponent<Beam>();
+            if (beam == null) continue;
+            _beamsSeen.Add(b.Id);
+            var from = new Vector2(beam.BeamStartNum.X, beam.BeamStartNum.Y) * PoeMapExtension.WorldToGridConversion;
+            var to = new Vector2(beam.BeamEndNum.X, beam.BeamEndNum.Y) * PoeMapExtension.WorldToGridConversion;
+            if (!_mapObjects.Values.Any(o => o.kind == "cauldron" && Vector2.Distance(o.grid, from) <= BeamOnCauldronGrid))
+            {
+                Log($"map: ignored beam {from.X:F0},{from.Y:F0} -> {to.X:F0},{to.Y:F0} (not on a cauldron)");
+                continue;
+            }
+            _beamTargets.Add((from, to));
+            Log($"map: cauldron beam {from.X:F0},{from.Y:F0} -> next target at {to.X:F0},{to.Y:F0} ({Vector2.Distance(from, to):F0} grid)");
+        }
+    }
+
+    private void LogCards(Snapshot s)
+    {
+        if (_zoneFactions == null && DateTime.Now >= _zoneScanDue)
+        {
+            _zoneFactions = ScanZoneFactions();
+            WriteCardRow("zone", 0, 0, null, null);
+        }
+
+        if (s.Hand.Count == 0) _handSig = null;
+        if (s.Hand.Count > 0 && s.WindowVisible && s.Mode != FatesMode.Invoke && s.Fates.Count == s.Hand.Count)
+        {
+            var sig = string.Join("|", s.Fates.Select(f => f.Id + "/" + string.Join("+", f.Rewards.Select(r => r.Id))));
+            if (sig != _handSig)
+            {
+                _handSig = sig;
+                _handSeq++;
+                _offered = s.Fates;
+                for (var i = 0; i < s.Fates.Count; i++) WriteFate("offered", i, s.Fates[i]);
+            }
+        }
+
+        if (s.Handler == 0) return;
+        if (_collectedCount >= 0 && s.Collected.Count > _collectedCount)
+        {
+            foreach (var c in s.Collected.Skip(_collectedCount))
+            {
+                var slot = _offered.FindIndex(f => f.Id == c.Name && (f.Rewards.FirstOrDefault()?.Id ?? "-") == c.Outcomes[0]);
+                if (slot >= 0) WriteFate("picked", slot, _offered[slot]);
+                else WriteCardRow("picked", -1, 0, null, null, c.Name, rewardId: c.Outcomes[0]);
+            }
+        }
+
+        _collectedCount = s.Collected.Count;
+    }
+
+    private void WriteFate(string evt, int slot, FateCard f)
+    {
+        if (f.Rewards.Count == 0) WriteCardRow(evt, slot, f.Tier, f, null);
+        foreach (var r in f.Rewards) WriteCardRow(evt, slot, f.Tier, f, r);
+    }
+
+    private void WriteCardRow(string evt, int slot, int tier, FateCard f, Reward r, string cardId = null, string rewardId = null)
+    {
+        if (_cardsPath == null) return;
+        var area = GameController.Area?.CurrentArea;
+        var fields = new object[]
+        {
+            DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), area?.Name, area?.RealLevel, _zoneFactions, evt, evt == "zone" ? "" : _handSeq.ToString(),
+            evt == "zone" ? "" : slot.ToString(), f?.Name ?? cardId, f?.Faction, tier == 0 ? "" : tier.ToString(), f?.DownsideMod,
+            r?.Id ?? rewardId, r == null ? "" : ((int)r.Class).ToString(), r?.LevelMin, r?.LevelMax,
+        };
+        var line = string.Join(",", fields.Select(v => Csv(v?.ToString())));
+        try
+        {
+            if (!File.Exists(_cardsPath)) File.WriteAllText(_cardsPath, CardsHeader + Environment.NewLine);
+            File.AppendAllText(_cardsPath, line + Environment.NewLine);
+        }
+        catch (IOException) { }
+    }
+
+    private static string Csv(string v)
+    {
+        if (string.IsNullOrEmpty(v)) return "";
+        return v.IndexOfAny(new[] { ',', '"', '\n', '\r' }) < 0 ? v : "\"" + v.Replace("\"", "\"\"") + "\"";
+    }
+
+    private string ScanZoneFactions()
+    {
+        try
+        {
+            var change = GameController.Game.AreaChangeCount;
+            var found = new SortedSet<string>();
+            foreach (var file in new FilesFromMemory(Mem).GetAllFiles())
+            {
+                if (file.Value.ChangeCount != change) continue;
+                foreach (var (prefix, faction) in FactionMonsters)
+                    if (file.Key.StartsWith(prefix, StringComparison.Ordinal))
+                        found.Add(faction);
+            }
+
+            var result = found.Count == 0 ? "none" : string.Join("+", found);
+            Log($"zone factions: {result}");
+            return result;
+        }
+        catch (Exception e)
+        {
+            Log($"zone faction scan failed: {e.Message}");
+            return "error";
+        }
     }
 
     private Snapshot Read()
@@ -199,6 +444,7 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         if (s.Window == 0) return;
         var window = Mem.Read<FatesWindow>(s.Window);
         s.WindowVisible = (window.ElementFlags & FatesWindow.VisibleBit) != 0;
+        s.Mode = window.Mode;
         if (!Sane(window.Hand, 0x40, MaxCards) || !Sane(window.CardWidgets, 8, MaxCards)) return;
         var count = (int)((window.Hand.Last - window.Hand.First) / 0x40);
         var widgets = Mem.ReadStdVector<long>(window.CardWidgets);
@@ -345,6 +591,13 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
 
     public override void Render()
     {
+        if (++_minimapProbe >= 30)
+        {
+            _minimapProbe = 0;
+            HookMinimap();
+        }
+
+        DrawOnLargeMap();
         if (!Settings.ShowWindow) return;
         var open = Settings.ShowWindow;
         if (Win.Begin("Augury", "augury_main", ref open, 0, new Vector2(520, 640))) DrawBody();
@@ -357,6 +610,10 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         base.DrawSettings();
         ImGui.Checkbox("Show window", ref Settings.ShowWindow);
         ImGui.Checkbox("Log changes to file", ref Settings.LogToFile);
+        ImGui.Checkbox("Log every offered/picked card to CSV", ref Settings.LogCards);
+        ImGui.Checkbox("Draw unreached beam targets (ExileMinimap, else large map)", ref Settings.DrawBeamTargets);
+        ImGui.TextUnformatted(_minimapToScreen != null ? "drawing on: ExileMinimap" : "drawing on: large map");
+        ImGui.TextUnformatted(_cardsPath ?? "");
         ImGui.InputInt("Poll ms", ref Settings.PollMs);
         Settings.PollMs = Math.Clamp(Settings.PollMs, 50, 5000);
         ImGui.TextUnformatted(_logPath ?? "");
@@ -373,6 +630,7 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         Win.TabBar("augury_tabs",
             ("Fates", () => { DrawFates(s); return false; }),
             ("Cards", () => { DrawCards("Hand", s.Hand); DrawCards("Collected", s.Collected); DrawTally(s); return false; }),
+            ("Map", () => { DrawMap(); return false; }),
             ("Grim Fates", () => { DrawGrim(s); return false; }),
             ("Flags", () => { DrawFlags(s); return false; }),
             ("Log", () => { DrawLog(); return false; }));
@@ -415,6 +673,19 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
                 ImGui.TextWrapped(Esc(r.Text ?? "-"));
                 ImGui.Unindent();
             }
+        }
+    }
+
+    private void DrawMap()
+    {
+        ImGui.SeparatorText($"Seen this area: {_mapObjects.Count}");
+        foreach (var o in _mapObjects.Values.OrderBy(o => o.kind))
+            ImGui.TextUnformatted($"{o.kind,-8} {o.grid.X,5:F0},{o.grid.Y,5:F0}{(o.chosen >= 0 ? $"  card_chosen={o.chosen}" : "")}");
+        ImGui.SeparatorText($"Beam targets: {_beamTargets.Count}");
+        foreach (var (from, to) in _beamTargets)
+        {
+            var found = _mapObjects.Values.FirstOrDefault(o => Vector2.Distance(o.grid, to) <= BeamOnCauldronGrid);
+            ImGui.TextUnformatted($"{from.X,5:F0},{from.Y,5:F0} -> {to.X,5:F0},{to.Y,5:F0}  {(found.kind == null ? "not reached yet" : "= " + found.kind)}");
         }
     }
 
