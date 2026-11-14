@@ -63,6 +63,13 @@ public static class ServerDataOffsets
     public const int GrimFateCount = 11;
 }
 
+[StructLayout(LayoutKind.Explicit)]
+public struct GuardedComponent
+{
+    // 1 while the cauldron's guard pack lives; the only field the client keeps, the guard list is server-side
+    [FieldOffset(0x20)] public byte IsGuarded;
+}
+
 [StructLayout(LayoutKind.Explicit, Size = 0x10)]
 public struct DatRowRef
 {

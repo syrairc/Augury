@@ -97,9 +97,12 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
     private List<FateCard> _offered = new();
     private int _collectedCount = -1;
     private const float BeamOnCauldronGrid = 30f;
+    private const float PickBeamGrid = 20f;
     private readonly Dictionary<uint, (string kind, Vector2 grid, int chosen)> _mapObjects = new();
     private readonly List<(Vector2 from, Vector2 to)> _beamTargets = new();
     private readonly HashSet<uint> _beamsSeen = new();
+    private readonly HashSet<uint> _beamsIgnoredLogged = new();
+    private readonly Dictionary<uint, DateTime> _beamBorn = new();
     private Func<Vector2, Vector2> _minimapToScreen;
     private int _minimapProbe;
     private const string MinimapOverlayKey = "Augury";
@@ -189,6 +192,8 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         _mapObjects.Clear();
         _beamTargets.Clear();
         _beamsSeen.Clear();
+        _beamsIgnoredLogged.Clear();
+        _beamBorn.Clear();
         Log($"area -> {area?.Name}");
     }
 
@@ -206,11 +211,14 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
     private void TrackMap()
     {
         var beams = new List<Entity>();
+        var aliveBeams = new HashSet<uint>();
         foreach (var e in GameController.Entities)
         {
             if (e == null || !e.IsValid) continue;
             if (e.Path == AuguryPaths.Beam)
             {
+                aliveBeams.Add(e.Id);
+                _beamBorn.TryAdd(e.Id, DateTime.Now);
                 if (!_beamsSeen.Contains(e.Id)) beams.Add(e);
                 continue;
             }
@@ -219,6 +227,8 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
             if (kind == null) continue;
             var chosen = e.GetComponent<StateMachine>()?.States?.FirstOrDefault(st => st.Name == AuguryPaths.CardChosenState)?.Value ?? -1;
             var grid = e.GridPosNum;
+            if (e.CacheComp.TryGetValue("Guarded", out var guardedAddr) && guardedAddr != 0)
+                Track($"guarded {kind} {grid.X:F0},{grid.Y:F0}", Mem.Read<GuardedComponent>(guardedAddr).IsGuarded.ToString());
             if (!_mapObjects.TryGetValue(e.Id, out var old)) Log($"map: {kind} at {grid.X:F0},{grid.Y:F0}{(chosen >= 0 ? $" card_chosen={chosen}" : "")}");
             else if (old.chosen != chosen)
             {
@@ -230,6 +240,12 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
                     if (near != null && Vector2.Distance(near.GridPosNum, grid) <= 80f) _pickWatchSeen.Add(near.Id);
             }
             _mapObjects[e.Id] = (kind, grid, (int)chosen);
+        }
+
+        foreach (var id in _beamBorn.Keys.Where(id => !aliveBeams.Contains(id)).ToList())
+        {
+            Log($"map: beam id={id} despawned after {(DateTime.Now - _beamBorn[id]).TotalSeconds:F1}s (+-{Settings.PollMs / 1000.0:F1}s, wall clock, pauses count)");
+            _beamBorn.Remove(id);
         }
 
         if (DateTime.Now <= _pickWatchUntil)
@@ -248,14 +264,19 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         {
             var beam = b.GetComponent<Beam>();
             if (beam == null) continue;
-            _beamsSeen.Add(b.Id);
             var from = new Vector2(beam.BeamStartNum.X, beam.BeamStartNum.Y) * PoeMapExtension.WorldToGridConversion;
             var to = new Vector2(beam.BeamEndNum.X, beam.BeamEndNum.Y) * PoeMapExtension.WorldToGridConversion;
-            if (!_mapObjects.Values.Any(o => o.kind == "cauldron" && Vector2.Distance(o.grid, from) <= BeamOnCauldronGrid))
+            var inPickWindow = DateTime.Now <= _pickWatchUntil && Vector2.Distance(_pickWatchAt, from) <= PickBeamGrid;
+            if (!inPickWindow)
             {
-                Log($"map: ignored beam {from.X:F0},{from.Y:F0} -> {to.X:F0},{to.Y:F0} (not on a cauldron)");
+                var onCauldron = _mapObjects.Values.Any(o => o.kind == "cauldron" && Vector2.Distance(o.grid, from) <= BeamOnCauldronGrid);
+                if (!onCauldron) _beamsSeen.Add(b.Id);
+                if (_beamsIgnoredLogged.Add(b.Id))
+                    Log($"map: ignored beam {from.X:F0},{from.Y:F0} -> {to.X:F0},{to.Y:F0} ({(onCauldron ? "at a cauldron but not after a pick" : "not on a cauldron")})");
                 continue;
             }
+
+            _beamsSeen.Add(b.Id);
             _beamTargets.Add((from, to));
             Log($"map: cauldron beam {from.X:F0},{from.Y:F0} -> next target at {to.X:F0},{to.Y:F0} ({Vector2.Distance(from, to):F0} grid)");
         }
@@ -289,7 +310,7 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
             {
                 var slot = _offered.FindIndex(f => f.Id == c.Name && (f.Rewards.FirstOrDefault()?.Id ?? "-") == c.Outcomes[0]);
                 if (slot >= 0) WriteFate("picked", slot, _offered[slot]);
-                else WriteCardRow("picked", -1, 0, null, null, c.Name, rewardId: c.Outcomes[0]);
+                else WriteCardRow("carried", -1, 0, null, null, c.Name, rewardId: c.Outcomes[0]);
             }
         }
 
