@@ -194,7 +194,7 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         _beamsSeen.Clear();
         _beamsIgnoredLogged.Clear();
         _beamBorn.Clear();
-        Log($"area -> {area?.Name}");
+        Log($"area -> {area?.Name} lvl {area?.RealLevel}");
     }
 
     public override Job Tick()
@@ -579,10 +579,10 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         Track("handler", s.Handler == 0 ? "missing" : $"0x{s.Handler:X}");
         Track("changeCounter", a.ChangeCounter.ToString());
         Track("fatesWindow", s.Window == 0 ? "missing" : $"0x{s.Window:X} {(s.WindowVisible ? "open" : "closed")}");
-        Track("fates", string.Join(" | ", s.Fates));
-        Track("hand", string.Join(" | ", s.Hand));
-        Track("collected", string.Join(" | ", s.Collected));
-        Track("tally", string.Join(", ", s.Tally.Select(t => $"{t.outcome}={t.count}")));
+        Track("fates", string.Join(" | ", s.Fates), true);
+        Track("hand", string.Join(" | ", s.Hand), true);
+        Track("collected", string.Join(" | ", s.Collected), true);
+        Track("tally", string.Join(", ", s.Tally.Select(t => $"{t.outcome}={t.count}")), true);
         Track("fateLimit", a.FateLimit.ToString());
         Track("tier", a.Tier.ToString());
         Track("spawns", (Sane(a.Spawns, 8, MaxCards) ? (a.Spawns.Last - a.Spawns.First) / 8 : 0).ToString());
@@ -591,13 +591,14 @@ public class Augury : BaseSettingsPlugin<AugurySettings>
         Track("viscera", string.Join(" | ", s.Viscera));
     }
 
-    private void Track(string key, string value)
+    private void Track(string key, string value, bool tagArea = false)
     {
         if (_last.TryGetValue(key, out var old) && old == value) return;
         var first = !_last.ContainsKey(key);
         _last[key] = value;
         if (first && value.Length == 0) return;
-        Log($"{key}: {(first ? "" : $"{old} -> ")}{value}");
+        var area = tagArea ? GameController.Area?.CurrentArea : null;
+        Log($"{key}: {(first ? "" : $"{old} -> ")}{value}{(area == null ? "" : $" [{area.Name} lvl {area.RealLevel}]")}");
     }
 
     private void Log(string line)
